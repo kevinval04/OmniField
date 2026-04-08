@@ -1,0 +1,9 @@
+torch>=2.0
+einops>=0.6.0
+numpy
+netCDF4
+xarray
+requests
+tqdm
+cosine-annealing-warmup
+matplotlib
