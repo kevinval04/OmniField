@@ -56,7 +56,7 @@ OmniField is a continuity-aware framework that learns a continuous neural field 
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/omnifield.git
+git clone https://github.com/kevinval04/OmniField.git
 cd omnifield
 pip install -r requirements.txt
 ```
