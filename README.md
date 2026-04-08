@@ -2,7 +2,7 @@
 
 **Published as a conference paper at ICLR 2026**
 
-[Paper](https://openreview.net/forum?id=XXXX) • [arXiv](https://arxiv.org/abs/XXXX)
+[Paper](https://openreview.net/forum?id=VpWDZ3yTBn) • [arXiv](https://arxiv.org/abs/2511.02205)
 
 Kevin Valencia<sup>1</sup>, Thilina Balasooriya<sup>2</sup>, Xihaier Luo<sup>3</sup>, Shinjae Yoo<sup>3</sup>, David Keetae Park<sup>3</sup>
 
@@ -71,7 +71,7 @@ pip install -r requirements.txt
 
 ### ClimSim-THW
 
-1. **Download** the first 10,000 snapshots from [ClimSim High-Res](https://huggingface.co/datasets/LEAP/ClimSim_high_res):
+1. **Download** the first 10,000 snapshots from [ClimSim High-Res](https://huggingface.co/datasets/LEAP/ClimSim_high-res/tree/main):
 
 ```bash
 python scripts/download_climsim.py
