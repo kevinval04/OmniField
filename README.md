@@ -85,7 +85,7 @@ This downloads and extracts temperature (`state_t`), humidity (`state_q0001`), a
 
 ### EPA-AQS
 
-Download from the [EPA AQS Data Mart](https://www.epa.gov/aqs). We use records from 1987–2017 across six modalities (O₃, PM₂.₅, PM₁₀, NO₂, CO, SO₂) parsed by calendar day. The dataset expects a CSV with columns `Date`, `Defining Parameter`, `AQI`, `Latitude`, `Longitude`.
+Download from the [EPA AQS Data Mart](https://www.epa.gov/aqs) or from [Kaggle](https://www.kaggle.com/datasets/threnjen/40-years-of-air-quality-index-from-the-epa-daily). We use records from 1987–2017 across six modalities (O₃, PM₂.₅, PM₁₀, NO₂, CO, SO₂) parsed by calendar day. The dataset expects a CSV with columns `Date`, `Defining Parameter`, `AQI`, `Latitude`, `Longitude`.
 
 ## Training
 
