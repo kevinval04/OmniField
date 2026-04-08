@@ -85,9 +85,11 @@ This downloads and extracts temperature (`state_t`), humidity (`state_q0001`), a
 
 ### EPA-AQS
 
-Download from the [EPA AQS Data Mart](https://www.epa.gov/aqs). We use records from 1987–2017 across six modalities (O₃, PM₂.₅, PM₁₀, NO₂, CO, SO₂) parsed by calendar day.
+Download from the [EPA AQS Data Mart](https://www.epa.gov/aqs). We use records from 1987–2017 across six modalities (O₃, PM₂.₅, PM₁₀, NO₂, CO, SO₂) parsed by calendar day. The dataset expects a CSV with columns `Date`, `Defining Parameter`, `AQI`, `Latitude`, `Longitude`.
 
 ## Training
+
+### ClimSim-THW
 
 ```bash
 python train.py \
@@ -99,6 +101,17 @@ python train.py \
     --total_iters 100000 \
     --max_lr 8e-5 \
     --save_path checkpoints/best_model.pt
+```
+
+### EPA-AQS
+
+```bash
+python train_aqs.py \
+    --csv_path daily_aqi_by_county.csv \
+    --device cuda:0 \
+    --epochs 30 \
+    --max_lr 8e-5 \
+    --save_path checkpoints/best_aqs_model.pt
 ```
 
 All hyperparameters match those reported in Appendix A of the paper. Training was performed on a single NVIDIA H100 80GB GPU.
@@ -125,13 +138,17 @@ omnifield/
 ├── .gitignore
 ├── norm_TQV_full.npz              # Pre-computed normalization stats
 ├── train.py                       # Training script (ClimSim-THW)
-├── evaluate.py                    # Evaluation script
+├── train_aqs.py                   # Training script (EPA-AQS)
+├── evaluate.py                    # Evaluation script (ClimSim-THW)
 ├── omnifield/
 │   ├── __init__.py
 │   ├── model.py                   # OmniField architecture (GFF, MCT, ICMR, decoders)
+│   │                              #   CascadedPerceiverIO — ClimSim-THW (3 modalities)
+│   │                              #   OmniFieldAQS — EPA-AQS (6 modalities)
 │   └── data/
 │       ├── __init__.py
-│       └── climsim.py             # ClimSim-THW dataset with Venn sensor partition
+│       ├── climsim.py             # ClimSim-THW dataset with Venn sensor partition
+│       └── epa_aqs.py             # EPA-AQS point-cloud dataset
 ├── baselines/                     # Baseline model architectures used for comparison
 │   ├── fno.py                     # Fourier Neural Operator
 │   ├── resnet.py                  # ResNet-1D
