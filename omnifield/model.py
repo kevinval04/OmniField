@@ -1,11 +1,13 @@
 """
 OmniField: Conditioned Neural Fields for Robust Multimodal Spatiotemporal Learning.
 
-This module contains the core OmniField architecture:
-  - GaussianFourierFeatures (GFF) for spatial/temporal encoding
-  - Sinusoidal initialization for learnable queries
-  - CascadedBlock (per-modality encoder with cross-attention)
-  - CascadedPerceiverIO (full model with MCT + ICMR + per-modality decoders)
+Core architecture for ClimSim-THW (3 modalities: Temperature, Humidity, Wind speed).
+
+Components:
+  - GaussianFourierFeatures (GFF)          — Section 4.1
+  - Sinusoidal initialization              — Section 4.1 / Appendix B.2
+  - CascadedBlock (per-modality encoder)   — Section 4, E_m
+  - CascadedPerceiverIO (full OmniField)   — Section 4.2 (MCT + ICMR)
 
 Reference: Valencia et al., "OmniField: Conditioned Neural Fields for Robust
 Multimodal Spatiotemporal Learning", ICLR 2026.
@@ -13,7 +15,6 @@ Multimodal Spatiotemporal Learning", ICLR 2026.
 
 import numpy as np
 from math import log
-from functools import wraps
 
 import torch
 import torch.nn as nn
@@ -30,19 +31,6 @@ def exists(val):
 
 def default(val, d):
     return val if exists(val) else d
-
-def cache_fn(f):
-    cache = None
-    @wraps(f)
-    def cached_fn(*args, _cache=True, **kwargs):
-        if not _cache:
-            return f(*args, **kwargs)
-        nonlocal cache
-        if cache is not None:
-            return cache
-        cache = f(*args, **kwargs)
-        return cache
-    return cached_fn
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +82,6 @@ class Attention(nn.Module):
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias=False)
         self.to_out = nn.Linear(inner_dim, query_dim)
-        self.latest_attn = None
 
     def forward(self, x, context=None, mask=None):
         h = self.heads
@@ -111,14 +98,13 @@ class Attention(nn.Module):
             sim.masked_fill_(~mask, max_neg_value)
 
         attn = sim.softmax(dim=-1)
-        self.latest_attn = attn.detach()
         out = torch.einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
 
 
 # ---------------------------------------------------------------------------
-# Gaussian Fourier Features (GFF)  –  Section 4.1
+# Gaussian Fourier Features (GFF)  —  Section 4.1
 # ---------------------------------------------------------------------------
 
 class GaussianFourierFeatures(nn.Module):
@@ -126,7 +112,9 @@ class GaussianFourierFeatures(nn.Module):
 
     Replaces fixed sinusoidal Fourier features with randomly sampled
     frequencies from N(0, scale^2), yielding a richer spectral
-    representation that captures high-frequency detail (Tancik et al., 2020).
+    representation (Tancik et al., 2020).
+
+    Output dim = 2 * mapping_size (sin + cos).
     """
 
     def __init__(self, in_features: int, mapping_size: int, scale: float = 15.0):
@@ -141,18 +129,14 @@ class GaussianFourierFeatures(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Sinusoidal Initialization  –  Section 4.1 / Appendix B.2
+# Sinusoidal Initialization  —  Section 4.1 / Appendix B.2
 # ---------------------------------------------------------------------------
 
 def get_sinusoidal_embeddings(n: int, d: int) -> torch.Tensor:
     """Multi-scale sinusoidal initialization for learnable query tokens.
 
-    Args:
-        n: Number of latent tokens (num_latents).
-        d: Embedding dimension (latent_dim). Must be even.
-
-    Returns:
-        Tensor of shape (n, d) with unit-norm rows.
+    Each row has unit norm (s = d^{-1/2}), keeping initial attention
+    logits well-scaled. Uses log-spaced frequency bands.
     """
     assert d % 2 == 0, "latent_dim must be even for sinusoidal embeddings"
     position = torch.arange(n, dtype=torch.float).unsqueeze(1)
@@ -164,13 +148,13 @@ def get_sinusoidal_embeddings(n: int, d: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# CascadedBlock  –  per-modality encoder stage
+# CascadedBlock  —  per-modality encoder stage (E_m in paper)
 # ---------------------------------------------------------------------------
 
 class CascadedBlock(nn.Module):
-    """Single encoder stage: cross-attend from input tokens into learnable
-    latents (sinusoidally initialized), optionally fusing a residual from
-    the previous stage's global latent."""
+    """Single encoder stage: cross-attend from input tokens into
+    sinusoidally-initialized learnable latents, with optional residual
+    from global feature z (ICMR feedback, Eq. 1)."""
 
     def __init__(self, dim, n_latents, input_dim, cross_heads, cross_dim_head,
                  self_heads, self_dim_head, residual_dim=None):
@@ -193,278 +177,358 @@ class CascadedBlock(nn.Module):
     def forward(self, x, context, mask=None, residual=None):
         b = context.size(0)
         latents = repeat(self.latents, 'n d -> b n d', b=b)
+
+        # Cross-attend: learnable latents query the per-modality input tokens
         latents = self.cross_attn(latents, context=context, mask=mask) + latents
+
+        # ICMR residual: inject global feature z from previous stage (⊕ in Eq. 1)
         if residual is not None:
             if self.residual_proj:
                 residual = self.residual_proj(residual)
             latents = latents + residual
+
         latents = self.self_attn(latents) + latents
         latents = self.ff(latents) + latents
         return latents
 
 
 # ---------------------------------------------------------------------------
-# CascadedPerceiverIO  –  Full OmniField Architecture  (Section 4)
+# OmniField base  —  shared ICMR + decode logic
 # ---------------------------------------------------------------------------
 
-class CascadedPerceiverIO(nn.Module):
-    """OmniField: encoder–processor–decoder with MCT blocks and ICMR.
+class OmniFieldBase(nn.Module):
+    """Base class implementing the ICMR loop and decoder pattern.
 
-    Architecture overview (Fig. 2d in paper):
-      - Per-modality input projections (value → embedding)
-      - L stages of CascadedBlock per modality (encoder E_m)
-      - At each stage, modality latents are concatenated (MCT) and
-        processed through shared self-attention blocks (processor P)
-      - Global feature z is mean-pooled and fed back as residual (ICMR)
-      - Per-modality decoder heads decode from the final fused latent
+    Subclasses define modality-specific encoders, projections, and decoders.
+    This keeps the core MCT+ICMR logic (Eq. 1) in one place.
+    """
 
-    Args:
-        input_dim:      Dimension of per-modality input tokens (after projection + pos enc).
-        queries_dim:    Dimension of decoder query tokens (pos enc + time enc).
-        logits_dim:     If set, project decoder output to this dim. None = identity.
-        latent_dims:    Tuple of latent dimensions per ICMR stage.
-        num_latents:    Tuple of number of latent tokens per stage.
-        cross_heads:    Number of cross-attention heads.
-        cross_dim_head: Dimension per cross-attention head.
-        self_heads:     Number of self-attention heads.
-        self_dim_head:  Dimension per self-attention head.
-        decoder_ff:     Whether to include feedforward in decoder.
+    def _icmr_forward(self, xs, used, enc_blocks_list, g2l_projs_list):
+        """Run the ICMR loop over L stages.
+
+        Args:
+            xs: list of per-modality token tensors (or None if absent).
+            used: list of bools — which modalities are present.
+            enc_blocks_list: list of nn.ModuleList, one per modality.
+            g2l_projs_list: list of nn.ModuleList (global→latent projections),
+                            one per modality. If a single nn.ModuleList is passed,
+                            it is shared across all modalities.
+
+        Returns:
+            global_latent: [B, n_fused, D] — the final fused latent g = h^(L-1).
+        """
+        shared_proj = not isinstance(g2l_projs_list, list)
+
+        def residual_from_global(global_latent, proj_layer, n_lat, d_lat):
+            if global_latent is None:
+                return None
+            G_pool = global_latent.mean(dim=1)  # z^(k+1) = mean(h^(k))
+            return proj_layer(G_pool).view(G_pool.size(0), n_lat, d_lat)
+
+        global_latent = None  # z^(0) = 0
+
+        for stage_idx in range(len(self.latent_dims)):
+            stage_latents = []
+            nL = self.num_latents[stage_idx]
+            dL = self.latent_dims[stage_idx]
+
+            for mi in range(len(xs)):
+                if not (used[mi] and xs[mi] is not None):
+                    continue
+                if shared_proj:
+                    proj = g2l_projs_list[stage_idx]
+                else:
+                    proj = g2l_projs_list[mi][stage_idx]
+                R = residual_from_global(global_latent, proj, nL, dL)
+                latent_m = enc_blocks_list[mi][stage_idx](x=None, context=xs[mi], residual=R)
+                stage_latents.append(latent_m)
+
+            if not stage_latents:
+                if global_latent is None:
+                    raise ValueError("No modalities present — cannot run forward pass.")
+                continue  # carry previous global forward
+
+            # MCT: ⊙ concatenate + P self-attn trunk
+            fused = torch.cat(stage_latents, dim=1)
+            for sa_block in self.self_attn_blocks:
+                fused = sa_block[0](fused) + fused
+                fused = sa_block[1](fused) + fused
+            global_latent = fused
+
+        return global_latent
+
+    def _decode(self, queries, global_latent, decoder_specs):
+        """Decode per-modality outputs from global latent.
+
+        Args:
+            queries: [B, Nq, queries_dim]
+            global_latent: [B, n_fused, D]
+            decoder_specs: list of (cross_attn, ff_or_None, linear_head)
+
+        Returns:
+            list of [B, Nq, 1] tensors.
+        """
+        if queries.ndim == 2:
+            queries = queries.unsqueeze(0).expand(global_latent.size(0), -1, -1)
+
+        outputs = []
+        for cross_attn, ff, head in decoder_specs:
+            x = cross_attn(queries, context=global_latent) + queries
+            if ff is not None:
+                x = x + ff(x)
+            outputs.append(head(x))
+        return outputs
+
+
+# ---------------------------------------------------------------------------
+# CascadedPerceiverIO  —  OmniField for ClimSim-THW (3 modalities)
+# ---------------------------------------------------------------------------
+
+class CascadedPerceiverIO(OmniFieldBase):
+    """OmniField for ClimSim-THW: Temperature, Humidity, Wind speed.
+
+    Hyperparameters from Appendix A:
+        input_dim=192, queries_dim=96, latent_dims=(128,128,128),
+        num_latents=(128,128,128), cross_heads=4, cross_dim_head=128,
+        self_heads=8, self_dim_head=128, decoder_ff=True, trunk_layers=3.
     """
 
     def __init__(
-        self,
-        *,
-        input_dim,
-        queries_dim,
-        logits_dim=None,
-        latent_dims=(128, 128, 128),
-        num_latents=(128, 128, 128),
-        cross_heads=4,
-        cross_dim_head=128,
-        self_heads=8,
-        self_dim_head=128,
-        decoder_ff=True,
+        self, *, input_dim, queries_dim, logits_dim=None,
+        latent_dims=(128, 128, 128), num_latents=(128, 128, 128),
+        cross_heads=4, cross_dim_head=128, self_heads=8, self_dim_head=128,
+        decoder_ff=True, num_trunk_layers=3,
     ):
         super().__init__()
-
         assert len(latent_dims) == len(num_latents)
         self.latent_dims = list(latent_dims)
         self.num_latents = list(num_latents)
-        num_stages = len(latent_dims)
-        final_latent_dim = latent_dims[-1]
+        final_dim = latent_dims[-1]
 
-        # --- Per-modality input projections ---
+        # Per-modality input projections: [lon, lat, value] → R^128
         self.input_proj_T = nn.Sequential(nn.Linear(3, 128), nn.GELU(), nn.Linear(128, 128))
         self.input_proj_Q = nn.Sequential(nn.Linear(3, 128), nn.GELU(), nn.Linear(128, 128))
         self.input_proj_V = nn.Sequential(nn.Linear(3, 128), nn.GELU(), nn.Linear(128, 128))
 
-        # --- Per-modality encoder blocks (L stages each) ---
-        def make_encoder_blocks():
+        # Per-modality encoder blocks E_m
+        def _enc():
             blocks = nn.ModuleList()
-            prev_dim = None
-            for dim, n_lat in zip(latent_dims, num_latents):
-                blocks.append(CascadedBlock(
-                    dim=dim, n_latents=n_lat, input_dim=input_dim,
-                    cross_heads=cross_heads, cross_dim_head=cross_dim_head,
-                    self_heads=self_heads, self_dim_head=self_dim_head,
-                    residual_dim=prev_dim,
-                ))
-                prev_dim = dim
+            prev = None
+            for d, n in zip(latent_dims, num_latents):
+                blocks.append(CascadedBlock(d, n, input_dim, cross_heads, cross_dim_head,
+                                            self_heads, self_dim_head, prev))
+                prev = d
             return blocks
 
-        self.encoder_blocks_T = make_encoder_blocks()
-        self.encoder_blocks_Q = make_encoder_blocks()
-        self.encoder_blocks_V = make_encoder_blocks()
+        self.encoder_blocks_T = _enc()
+        self.encoder_blocks_Q = _enc()
+        self.encoder_blocks_V = _enc()
 
-        # --- ICMR: global-to-latent residual projections ---
-        self.global2latent_proj_T = nn.ModuleList([
-            nn.Linear(final_latent_dim, num_latents[i] * latent_dims[i])
-            for i in range(num_stages)
-        ])
-        self.global2latent_proj_Q = nn.ModuleList([
-            nn.Linear(final_latent_dim, num_latents[i] * latent_dims[i])
-            for i in range(num_stages)
-        ])
-        self.global2latent_proj_V = nn.ModuleList([
-            nn.Linear(final_latent_dim, num_latents[i] * latent_dims[i])
-            for i in range(num_stages)
-        ])
+        # ICMR: per-modality global→latent residual projections
+        def _g2l():
+            return nn.ModuleList([
+                nn.Linear(final_dim, num_latents[i] * latent_dims[i])
+                for i in range(len(latent_dims))
+            ])
 
-        # --- Shared self-attention trunk (processor P) ---
+        self.global2latent_proj_T = _g2l()
+        self.global2latent_proj_Q = _g2l()
+        self.global2latent_proj_V = _g2l()
+
+        # Processor P: shared self-attention trunk
         self.self_attn_blocks = nn.Sequential(*[
             nn.Sequential(
-                PreNorm(final_latent_dim, Attention(final_latent_dim, heads=self_heads, dim_head=self_dim_head)),
-                PreNorm(final_latent_dim, FeedForward(final_latent_dim)),
-            )
-            for _ in range(3)
+                PreNorm(final_dim, Attention(final_dim, heads=self_heads, dim_head=self_dim_head)),
+                PreNorm(final_dim, FeedForward(final_dim)),
+            ) for _ in range(num_trunk_layers)
         ])
 
-        # --- Cross-modal attention (MCT block components) ---
-        def _cross_attn():
-            return PreNorm(
-                final_latent_dim,
-                Attention(final_latent_dim, context_dim=final_latent_dim,
-                          heads=cross_heads, dim_head=cross_dim_head),
+        # Per-modality decoder heads D_{ω,m}
+        def _dec():
+            return (
+                PreNorm(queries_dim, Attention(queries_dim, final_dim, heads=cross_heads,
+                        dim_head=cross_dim_head), context_dim=final_dim),
+                PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None,
+                nn.Linear(queries_dim, 1),
             )
 
-        self.cross_T_from_Q = _cross_attn()
-        self.cross_T_from_V = _cross_attn()
-        self.cross_Q_from_T = _cross_attn()
-        self.cross_Q_from_V = _cross_attn()
-        self.cross_V_from_T = _cross_attn()
-        self.cross_V_from_Q = _cross_attn()
-
-        # --- Per-modality decoder heads ---
-        self.decoder_cross_attn_T = PreNorm(
-            queries_dim, Attention(queries_dim, final_latent_dim, heads=cross_heads, dim_head=cross_dim_head),
-            context_dim=final_latent_dim,
-        )
-        self.decoder_ff_T = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
-        self.to_logits_T = nn.Linear(queries_dim, 1)
-
-        self.decoder_cross_attn_Q = PreNorm(
-            queries_dim, Attention(queries_dim, final_latent_dim, heads=cross_heads, dim_head=cross_dim_head),
-            context_dim=final_latent_dim,
-        )
-        self.decoder_ff_Q = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
-        self.to_logits_Q = nn.Linear(queries_dim, 1)
-
-        self.decoder_cross_attn_V = PreNorm(
-            queries_dim, Attention(queries_dim, final_latent_dim, heads=cross_heads, dim_head=cross_dim_head),
-            context_dim=final_latent_dim,
-        )
-        self.decoder_ff_V = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
-        self.to_logits_V = nn.Linear(queries_dim, 1)
-
-        # --- Query self-attention ---
-        self.sa_queries_T = PreNorm(queries_dim, Attention(queries_dim, heads=4, dim_head=64))
-        self.sa_queries_Q = PreNorm(queries_dim, Attention(queries_dim, heads=4, dim_head=64))
-        self.sa_queries_V = PreNorm(queries_dim, Attention(queries_dim, heads=4, dim_head=64))
-
-        # --- Global projection (for ICMR feedback) ---
-        self.global_proj_T = nn.Linear(final_latent_dim, input_dim)
-        self.global_proj_Q = nn.Linear(final_latent_dim, input_dim)
-        self.global_proj_V = nn.Linear(final_latent_dim, input_dim)
-
-        # Legacy encoder blocks (kept for checkpoint compat)
-        self.encoder_blocks = nn.ModuleList()
-        prev_dim = None
-        for dim, n_lat in zip(latent_dims, num_latents):
-            self.encoder_blocks.append(CascadedBlock(
-                dim=dim, n_latents=n_lat, input_dim=input_dim,
-                cross_heads=cross_heads, cross_dim_head=cross_dim_head,
-                self_heads=self_heads, self_dim_head=self_dim_head,
-                residual_dim=prev_dim,
-            ))
-            prev_dim = dim
-
-        # Legacy shared decoder (kept for checkpoint compat)
-        self.decoder_cross_attn = PreNorm(
-            queries_dim, Attention(queries_dim, final_latent_dim, heads=cross_heads, dim_head=cross_dim_head),
-            context_dim=final_latent_dim,
-        )
-        self.decoder_ff = PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None
-        self.to_logits = nn.Linear(queries_dim, logits_dim) if exists(logits_dim) else nn.Identity()
-        self.input_proj = nn.Sequential(nn.Linear(3, 128), nn.GELU(), nn.Linear(128, 128))
-        self.projection_matrix = nn.Parameter(torch.randn(4, 128) / np.sqrt(4))
+        self.decoder_cross_attn_T, self.decoder_ff_T, self.to_logits_T = _dec()
+        self.decoder_cross_attn_Q, self.decoder_ff_Q, self.to_logits_Q = _dec()
+        self.decoder_cross_attn_V, self.decoder_ff_V, self.to_logits_V = _dec()
 
     def forward(self, x_T, x_Q, x_V, queries, used_modalities):
-        """Forward pass with fleximodal fusion.
-
+        """
         Args:
-            x_T: [B, S_T, input_dim] or None — encoded T modality tokens.
-            x_Q: [B, S_Q, input_dim] or None — encoded Q modality tokens.
-            x_V: [B, S_V, input_dim] or None — encoded V modality tokens.
-            queries: [B, N, queries_dim] — decoder query tokens (pos + time).
-            used_modalities: Tuple of 3 bools indicating which modalities are present.
-
+            x_T/Q/V: [B, S_m, input_dim] or None.
+            queries: [B, N, queries_dim].
+            used_modalities: (bool, bool, bool).
         Returns:
             (T_out, Q_out, V_out): each [B, N, 1].
         """
-
-        def residual_from_global(global_latent, proj_layer, n_latents_k, dim_k):
-            if global_latent is None:
-                return None
-            G_pool = global_latent.mean(dim=1)                          # [B, Dg]
-            R = proj_layer(G_pool).view(G_pool.size(0), n_latents_k, dim_k)
-            return R
-
-        global_latent = None
-        num_stages = len(self.latent_dims)
-
-        # === ICMR: iterative cross-modal refinement (Eq. 1) ===
-        for stage_idx in range(num_stages):
-            stage_latents = []
-            nL_k = self.num_latents[stage_idx]
-            d_k = self.latent_dims[stage_idx]
-
-            # Per-modality encoding with global residual feedback
-            if used_modalities[0] and x_T is not None:
-                R_T = residual_from_global(global_latent, self.global2latent_proj_T[stage_idx], nL_k, d_k)
-                latent_T = self.encoder_blocks_T[stage_idx](x=None, context=x_T, residual=R_T)
-                stage_latents.append(latent_T)
-
-            if used_modalities[1] and x_Q is not None:
-                R_Q = residual_from_global(global_latent, self.global2latent_proj_Q[stage_idx], nL_k, d_k)
-                latent_Q = self.encoder_blocks_Q[stage_idx](x=None, context=x_Q, residual=R_Q)
-                stage_latents.append(latent_Q)
-
-            if used_modalities[2] and x_V is not None:
-                R_V = residual_from_global(global_latent, self.global2latent_proj_V[stage_idx], nL_k, d_k)
-                latent_V = self.encoder_blocks_V[stage_idx](x=None, context=x_V, residual=R_V)
-                stage_latents.append(latent_V)
-
-            if not stage_latents:
-                raise ValueError("No modalities present — cannot run forward pass.")
-
-            # MCT: concatenate per-modality latents + shared self-attention
-            fused_latent = torch.cat(stage_latents, dim=1)
-            for sa_block in self.self_attn_blocks:
-                fused_latent = sa_block[0](fused_latent) + fused_latent
-                fused_latent = sa_block[1](fused_latent) + fused_latent
-
-            # ICMR: mean-pool → global feature z^(k+1)
-            global_latent = fused_latent
-
-        # === Decoder ===
-        if queries.ndim == 2:
-            queries = repeat(queries, 'n d -> b n d', b=global_latent.size(0))
-
-        def decode_branch(cross_attn, ff, head):
-            q = queries
-            x = cross_attn(q, context=global_latent)
-            x = x + q
-            if ff:
-                x = x + ff(x)
-            return head(x)
-
-        T_out = decode_branch(self.decoder_cross_attn_T, self.decoder_ff_T, self.to_logits_T)
-        Q_out = decode_branch(self.decoder_cross_attn_Q, self.decoder_ff_Q, self.to_logits_Q)
-        V_out = decode_branch(self.decoder_cross_attn_V, self.decoder_ff_V, self.to_logits_V)
-
+        global_latent = self._icmr_forward(
+            xs=[x_T, x_Q, x_V],
+            used=used_modalities,
+            enc_blocks_list=[self.encoder_blocks_T, self.encoder_blocks_Q, self.encoder_blocks_V],
+            g2l_projs_list=[self.global2latent_proj_T, self.global2latent_proj_Q, self.global2latent_proj_V],
+        )
+        T_out, Q_out, V_out = self._decode(queries, global_latent, [
+            (self.decoder_cross_attn_T, self.decoder_ff_T, self.to_logits_T),
+            (self.decoder_cross_attn_Q, self.decoder_ff_Q, self.to_logits_Q),
+            (self.decoder_cross_attn_V, self.decoder_ff_V, self.to_logits_V),
+        ])
         return T_out, Q_out, V_out
 
 
 # ---------------------------------------------------------------------------
-# Convenience: build default OmniField for ClimSim-THW
+# OmniFieldAQS  —  OmniField for EPA-AQS (6 modalities)
+# ---------------------------------------------------------------------------
+
+class OmniFieldAQS(OmniFieldBase):
+    """OmniField for EPA-AQS: O3, PM2.5, PM10, NO2, CO, SO2.
+
+    Key difference from ClimSim variant: uses a **shared** global→latent
+    projection across all modalities (single set of projection layers),
+    matching the paper's Eq. 1 where z is a single global feature.
+
+    Hyperparameters from Appendix A:
+        input_dim=128, queries_dim=64, latent_dims=(64,64,64),
+        num_latents=(64,64,64), cross_heads=2, cross_dim_head=32,
+        self_heads=2, self_dim_head=32, decoder_ff=False, trunk_layers=3.
+    """
+
+    MODALITIES = ["Ozone", "PM2.5", "PM10", "NO2", "CO", "SO2"]
+
+    def __init__(
+        self, *, input_dim=128, queries_dim=64, logits_dim=None,
+        latent_dims=(64, 64, 64), num_latents=(64, 64, 64),
+        cross_heads=2, cross_dim_head=32, self_heads=2, self_dim_head=32,
+        decoder_ff=False, num_trunk_layers=3,
+    ):
+        super().__init__()
+        assert len(latent_dims) == len(num_latents)
+        self.latent_dims = list(latent_dims)
+        self.num_latents = list(num_latents)
+        final_dim = latent_dims[-1]
+
+        # Per-modality input projections: [AQI, lat, lon] → R^input_dim
+        def _proj():
+            return nn.Sequential(nn.Linear(3, input_dim), nn.GELU(), nn.Linear(input_dim, input_dim))
+
+        self.input_proj_O3   = _proj()
+        self.input_proj_PM25 = _proj()
+        self.input_proj_PM10 = _proj()
+        self.input_proj_NO2  = _proj()
+        self.input_proj_CO   = _proj()
+        self.input_proj_SO2  = _proj()
+
+        # Context dim = input_dim + spatial GFF dim (64 for 2→32 bands)
+        context_dim = input_dim + 64
+
+        # Per-modality encoder blocks
+        def _enc():
+            blocks = nn.ModuleList()
+            prev = None
+            for d, n in zip(latent_dims, num_latents):
+                blocks.append(CascadedBlock(d, n, context_dim, cross_heads, cross_dim_head,
+                                            self_heads, self_dim_head, prev))
+                prev = d
+            return blocks
+
+        self.encoder_blocks_O3   = _enc()
+        self.encoder_blocks_PM25 = _enc()
+        self.encoder_blocks_PM10 = _enc()
+        self.encoder_blocks_NO2  = _enc()
+        self.encoder_blocks_CO   = _enc()
+        self.encoder_blocks_SO2  = _enc()
+
+        # ICMR: SHARED global→latent projections (one set for all modalities)
+        self.global2latent_proj = nn.ModuleList([
+            nn.Linear(final_dim, num_latents[i] * latent_dims[i])
+            for i in range(len(latent_dims))
+        ])
+
+        # Processor P
+        self.self_attn_blocks = nn.Sequential(*[
+            nn.Sequential(
+                PreNorm(final_dim, Attention(final_dim, heads=self_heads, dim_head=self_dim_head)),
+                PreNorm(final_dim, FeedForward(final_dim)),
+            ) for _ in range(num_trunk_layers)
+        ])
+
+        # Per-modality decoder heads
+        def _dec():
+            return (
+                PreNorm(queries_dim, Attention(queries_dim, final_dim, heads=cross_heads,
+                        dim_head=cross_dim_head), context_dim=final_dim),
+                PreNorm(queries_dim, FeedForward(queries_dim)) if decoder_ff else None,
+                nn.Linear(queries_dim, 1),
+            )
+
+        self.decoder_cross_attn_O3,   self.decoder_ff_O3,   self.to_logits_O3   = _dec()
+        self.decoder_cross_attn_PM25, self.decoder_ff_PM25, self.to_logits_PM25 = _dec()
+        self.decoder_cross_attn_PM10, self.decoder_ff_PM10, self.to_logits_PM10 = _dec()
+        self.decoder_cross_attn_NO2,  self.decoder_ff_NO2,  self.to_logits_NO2  = _dec()
+        self.decoder_cross_attn_CO,   self.decoder_ff_CO,   self.to_logits_CO   = _dec()
+        self.decoder_cross_attn_SO2,  self.decoder_ff_SO2,  self.to_logits_SO2  = _dec()
+
+    def forward(self, x_O3, x_PM25, x_PM10, x_NO2, x_CO, x_SO2,
+                queries, used_modalities):
+        """
+        Args:
+            x_*: [B, S_m, context_dim] or None — per-modality tokens.
+            queries: [B, Nq, queries_dim].
+            used_modalities: list/tuple of 6 bools.
+        Returns:
+            (O3, PM25, PM10, NO2, CO, SO2): each [B, Nq, 1].
+        """
+        xs = [x_O3, x_PM25, x_PM10, x_NO2, x_CO, x_SO2]
+        enc_list = [
+            self.encoder_blocks_O3, self.encoder_blocks_PM25, self.encoder_blocks_PM10,
+            self.encoder_blocks_NO2, self.encoder_blocks_CO, self.encoder_blocks_SO2,
+        ]
+
+        global_latent = self._icmr_forward(
+            xs=xs, used=used_modalities,
+            enc_blocks_list=enc_list,
+            g2l_projs_list=self.global2latent_proj,  # shared across modalities
+        )
+
+        outputs = self._decode(queries, global_latent, [
+            (self.decoder_cross_attn_O3,   self.decoder_ff_O3,   self.to_logits_O3),
+            (self.decoder_cross_attn_PM25, self.decoder_ff_PM25, self.to_logits_PM25),
+            (self.decoder_cross_attn_PM10, self.decoder_ff_PM10, self.to_logits_PM10),
+            (self.decoder_cross_attn_NO2,  self.decoder_ff_NO2,  self.to_logits_NO2),
+            (self.decoder_cross_attn_CO,   self.decoder_ff_CO,   self.to_logits_CO),
+            (self.decoder_cross_attn_SO2,  self.decoder_ff_SO2,  self.to_logits_SO2),
+        ])
+        return tuple(outputs)
+
+
+# ---------------------------------------------------------------------------
+# Convenience builders (Appendix A hyperparameters)
 # ---------------------------------------------------------------------------
 
 def build_omnifield_climsim(device="cuda"):
-    """Instantiate OmniField with default ClimSim-THW hyperparameters (Table A1)."""
-    pos_enc = GaussianFourierFeatures(2, 32, scale=15.0).to(device)
-    time_enc = GaussianFourierFeatures(1, 16, scale=10.0).to(device)
+    """Instantiate OmniField with ClimSim-THW hyperparameters from Appendix A."""
+    pos_enc = GaussianFourierFeatures(2, 32, scale=15.0).to(device)   # spatial: 2→64
+    time_enc = GaussianFourierFeatures(1, 16, scale=10.0).to(device)  # temporal: 1→32
 
     model = CascadedPerceiverIO(
-        input_dim=192,       # 128 (value proj) + 64 (pos enc: 2*32)
-        queries_dim=96,      # 64 (pos enc) + 32 (time enc: 2*16)
-        logits_dim=None,
-        latent_dims=(128, 128, 128),
-        num_latents=(128, 128, 128),
-        cross_heads=4,
-        cross_dim_head=128,
-        self_heads=8,
-        self_dim_head=128,
-        decoder_ff=True,
+        input_dim=192, queries_dim=96, latent_dims=(128, 128, 128),
+        num_latents=(128, 128, 128), cross_heads=4, cross_dim_head=128,
+        self_heads=8, self_dim_head=128, decoder_ff=True, num_trunk_layers=3,
     ).to(device)
+    return model, pos_enc, time_enc
 
+
+def build_omnifield_aqs(device="cuda"):
+    """Instantiate OmniField with EPA-AQS hyperparameters from Appendix A."""
+    pos_enc = GaussianFourierFeatures(2, 32, scale=15.0).to(device)   # spatial: 2→64
+    time_enc = GaussianFourierFeatures(1, 32, scale=15.0).to(device)  # temporal: 1→64
+
+    model = OmniFieldAQS(
+        input_dim=128, queries_dim=64, latent_dims=(64, 64, 64),
+        num_latents=(64, 64, 64), cross_heads=2, cross_dim_head=32,
+        self_heads=2, self_dim_head=32, decoder_ff=False, num_trunk_layers=3,
+    ).to(device)
     return model, pos_enc, time_enc
