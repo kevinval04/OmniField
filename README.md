@@ -10,9 +10,6 @@
   </a>
 </div>
 
-Kevin Valencia<sup>1</sup>, Thilina Balasooriya<sup>2</sup>, Xihaier Luo<sup>3</sup>, Shinjae Yoo<sup>3</sup>, David Keetae Park<sup>3</sup>
-
-<sup>1</sup>UCLA &nbsp; <sup>2</sup>Columbia University &nbsp; <sup>3</sup>Brookhaven National Laboratory
 
 ---
 
