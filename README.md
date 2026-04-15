@@ -170,11 +170,11 @@ omnifield/
 If you find this work useful, please cite:
 
 ```bibtex
-@inproceedings{valencia2026omnifield,
-  title     = {OmniField: Conditioned Neural Fields for Robust Multimodal Spatiotemporal Learning},
-  author    = {Valencia, Kevin and Balasooriya, Thilina and Luo, Xihaier and Yoo, Shinjae and Park, David Keetae},
-  booktitle = {International Conference on Learning Representations (ICLR)},
-  year      = {2026}
+@article{valencia2025omnifield,
+  title={OmniField: Conditioned Neural Fields for Robust Multimodal Spatiotemporal Learning},
+  author={Valencia, Kevin and Balasooriya, Thilina and Luo, Xihaier and Yoo, Shinjae and Park, David Keetae},
+  journal={arXiv preprint arXiv:2511.02205},
+  year={2025}
 }
 ```
 
