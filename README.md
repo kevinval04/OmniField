@@ -1,8 +1,14 @@
 # OmniField: Conditioned Neural Fields for Robust Multimodal Spatiotemporal Learning
 
 **Published as a conference paper at ICLR 2026**
-
-[Paper](https://openreview.net/forum?id=VpWDZ3yTBn) • [arXiv](https://arxiv.org/abs/2511.02205)
+<div style="text-align: center;">
+  <a href="https://openreview.net/forum?id=VpWDZ3yTBn">
+    <img src="https://img.shields.io/badge/OpenReview-Paper-blue" alt="OpenReview Paper">
+  </a>
+  <a href="https://arxiv.org/abs/2511.02205">
+    <img src="https://img.shields.io/badge/arXiv-2511.02205-b31b1b.svg" alt="arXiv">
+  </a>
+</div>
 
 Kevin Valencia<sup>1</sup>, Thilina Balasooriya<sup>2</sup>, Xihaier Luo<sup>3</sup>, Shinjae Yoo<sup>3</sup>, David Keetae Park<sup>3</sup>
 
